@@ -128,14 +128,16 @@
                 移動: <kbd>A</kbd> <kbd>D</kbd><br><br>
                 ジャンプ: <kbd>W</kbd> (2段可)<br><br>
                 攻撃(弱): 止まって <kbd>F</kbd><br><br>
-                攻撃(強): 歩きながら <kbd>F</kbd>
+                攻撃(強): 歩きながら <kbd>F</kbd><br><br>
+                ガード: <kbd>Shift(左)</kbd>
             </div>
             <div class="p2-color">
                 <h3>2P (BLUE) 操作</h3>
                 移動: <kbd>←</kbd> <kbd>→</kbd><br><br>
                 ジャンプ: <kbd>↑</kbd> (2段可)<br><br>
                 攻撃(弱): 止まって <kbd>/</kbd><br><br>
-                攻撃(強): 歩きながら <kbd>/</kbd>
+                攻撃(強): 歩きながら <kbd>/</kbd><br><br>
+                ガード: <kbd>Shift(右)</kbd>
             </div>
         </div>
         <div class="button-group">
@@ -177,7 +179,7 @@ let isPlaying = false;
 // 物理演算定数
 const GRAVITY = 0.6;
 const FRICTION_GROUND = 0.8;
-const FRICTION_AIR = 0.95;
+const FRICTION_AIR = 0.90; // 空中で滑りにくく（慣性を控えめに）
 const MAX_FALL_SPEED = 16;
 // 撃墜（バースト）になる画面外の境界線
 const BOUNDS = { top: -200, bottom: 600, left: -150, right: 950 };
@@ -228,6 +230,15 @@ function createHitEffect(x, y, isStrong) {
         let angle = Math.random() * Math.PI * 2;
         let speed = Math.random() * (isStrong ? 12 : 6) + 2;
         particles.push(new Particle(x, y, Math.cos(angle)*speed, Math.sin(angle)*speed, 20, color, isStrong ? 8 : 4));
+    }
+}
+
+// ガード（防御）成功時のエフェクト
+function createGuardEffect(x, y) {
+    for (let i = 0; i < 15; i++) {
+        let angle = Math.random() * Math.PI * 2;
+        let speed = Math.random() * 5 + 2;
+        particles.push(new Particle(x, y, Math.cos(angle)*speed, Math.sin(angle)*speed, 15, '#00e5ff', 5));
     }
 }
 
@@ -287,33 +298,104 @@ class Player {
         
         this.hitStun = 0; // ふっとび・硬直時間
         this.invincible = 0; // 復活時の無敵時間
+        
+        this.isGuarding = false; // ガード状態
+        
+        this.isLedgeGrabbing = false; // 崖つかまり状態
+        this.ledgeGrabCooldown = 0;   // 連続で崖をつかまないためのクールダウン
+
+        this.isRespawning = false; // リスポーン中かどうか
+        this.respawnTimer = 0;
+        this.targetRespawnY = 80; // 台座が停止する高さ
     }
 
     respawn() {
         this.damage = 0;
         this.x = this.spawnX;
-        this.y = 50; // 上空から復帰
+        this.y = -100; // 画面外上空から降りてくる
         this.vx = 0;
         this.vy = 0;
         this.hitStun = 0;
         this.isAttacking = false;
-        this.invincible = 120; // 約2秒間無敵
+        
+        this.isGuarding = false;
+        this.isLedgeGrabbing = false;
+        this.ledgeGrabCooldown = 0;
+        
+        this.isRespawning = true;
+        this.respawnTimer = 180; // 約3秒間待機
+        this.invincible = 0; // 降りてから無敵を付与
     }
 
     update(opponents) {
         if (this.lives <= 0) return;
         
+        // --- リスポーン中の処理 ---
+        if (this.isRespawning) {
+            if (this.y < this.targetRespawnY) {
+                this.y += 4; // 台座が降りてくる速度
+            } else {
+                this.respawnTimer--;
+                
+                // 移動・ジャンプ・下入力のいずれかで降りる
+                let inputToDescend = false;
+                if (this.controls.left && keys[this.controls.left]) inputToDescend = true;
+                if (this.controls.right && keys[this.controls.right]) inputToDescend = true;
+                if (this.controls.jump && isKeyJustPressed(this.controls.jump)) inputToDescend = true;
+                if (this.controls.down && keys[this.controls.down]) inputToDescend = true;
+
+                if (this.respawnTimer <= 0 || inputToDescend) {
+                    this.isRespawning = false;
+                    this.invincible = 120; // 降りてから約2秒間無敵
+                }
+            }
+            this.hitbox = null;
+            return; // 物理演算をスキップ
+        }
+
         if (this.invincible > 0) this.invincible--;
         if (this.attackCooldown > 0) this.attackCooldown--;
+        if (this.ledgeGrabCooldown > 0) this.ledgeGrabCooldown--;
         
         this.prevY = this.y;
+
+        // --- 崖つかまり中の処理 ---
+        if (this.isLedgeGrabbing) {
+            if (this.hitStun > 0) {
+                // ダメージを受けた場合は崖から落ちる
+                this.isLedgeGrabbing = false;
+                this.ledgeGrabCooldown = 30;
+            } else {
+                this.vx = 0;
+                this.vy = 0;
+                
+                // 下入力で手を離す
+                if (this.controls.down && keys[this.controls.down]) {
+                    this.isLedgeGrabbing = false;
+                    this.ledgeGrabCooldown = 30;
+                }
+                // ジャンプで崖上がり
+                if (this.controls.jump && isKeyJustPressed(this.controls.jump)) {
+                    this.doJump();
+                }
+                return; // 崖つかまり中は以降の移動・物理演算をスキップ
+            }
+        }
+
+        // --- ガード判定 ---
+        this.isGuarding = false;
+        // 地上にいて、攻撃中でなく、ふっとび中でない場合にガード可能
+        if (this.hitStun === 0 && this.isGrounded && !this.isAttacking && this.ledgeGrabCooldown === 0 && this.controls.guard && keys[this.controls.guard]) {
+            this.isGuarding = true;
+            this.vx *= 0.5; // ガード中は急ブレーキがかかる
+        }
 
         // --- 入力と移動 ---
         if (this.hitStun > 0) {
             // ふっとび中は操作不能、空気抵抗で減速
             this.hitStun--;
-            this.vx *= 0.98;
-        } else {
+            this.vx *= 0.96; // ふっとび中の減速を早め、慣性を抑える
+        } else if (!this.isGuarding) { // ガード中は移動・攻撃・ジャンプ不可
             // 左右移動
             if (this.controls.left && keys[this.controls.left]) {
                 this.vx -= this.speed;
@@ -361,9 +443,9 @@ class Player {
             // 攻撃発生フレーム（強・弱でタイミングと持続を変える）
             let isHitboxActive = false;
             if (this.isStrongAttack) {
-                isHitboxActive = (this.attackFrame > 15 && this.attackFrame < 22); // 発生少し遅め、判定やや長め
+                isHitboxActive = (this.attackFrame >= 18 && this.attackFrame <= 25); // 発生を早めに
             } else {
-                isHitboxActive = (this.attackFrame > 8 && this.attackFrame < 13);  // 発生早い、判定短め
+                isHitboxActive = (this.attackFrame >= 10 && this.attackFrame <= 14); // 発生を最速クラスに
             }
             
             if (isHitboxActive) {
@@ -378,34 +460,45 @@ class Player {
                         if (opp.lives > 0 && opp.invincible === 0 && rectIntersect(this.hitbox, opp)) {
                             this.hasHit = true;
                             
-                            // 基本ダメージとふっとばし力の計算
-                            let baseDmg, baseKbX, baseKbY;
-                            if (this.isStrongAttack) {
-                                baseDmg = 10 + Math.floor(Math.random() * 5); // 強: 10〜14%
-                                baseKbX = 6;  // ふっ飛びの初速を控えめに
-                                baseKbY = 6;
+                            if (opp.isGuarding) {
+                                // --- ガード成功時の処理 ---
+                                let pushBack = this.isStrongAttack ? 10 : 4;
+                                opp.vx = (this.facingRight ? 1 : -1) * pushBack; // ガードバック（後ろに押し出される）
+                                opp.hitStun = this.isStrongAttack ? 15 : 8; // ガード硬直
+                                
+                                hitStop = 6; // 攻撃側も少し止まる
+                                createGuardEffect(this.hitbox.x + hw/2, this.hitbox.y + 10);
                             } else {
-                                baseDmg = 2 + Math.floor(Math.random() * 3);  // 弱: 2〜4%
-                                baseKbX = 2.5;
-                                baseKbY = 3;
+                                // --- 通常ヒット（ガードしていない時）の処理 ---
+                                // 基本ダメージとふっとばし力の計算
+                                let baseDmg, baseKbX, baseKbY;
+                                if (this.isStrongAttack) {
+                                    baseDmg = 10 + Math.floor(Math.random() * 5); // 強: 10〜14%
+                                    baseKbX = 6;
+                                    baseKbY = 6;
+                                } else {
+                                    baseDmg = 2 + Math.floor(Math.random() * 3);  // 弱: 2〜4%
+                                    baseKbX = 2.5;
+                                    baseKbY = 3;
+                                }
+                                
+                                opp.damage += baseDmg;
+                                
+                                // 50%程度で撃墜できるよう、ダメージによる乗数カーブを調整
+                                let kbMultiplier = 1 + (opp.damage * 0.06); 
+                                
+                                opp.vx = (this.facingRight ? 1 : -1) * (baseKbX * kbMultiplier);
+                                opp.vy = -(baseKbY + (opp.damage * 0.04));
+                                
+                                // 相手を硬直させる
+                                opp.hitStun = (this.isStrongAttack ? 20 : 10) + Math.floor(opp.damage * 0.25);
+                                
+                                // ゲームフィールのためのヒットストップと画面揺れ
+                                hitStop = Math.min(12, Math.floor(kbMultiplier * (this.isStrongAttack ? 3 : 1)));
+                                screenShake = Math.min(30, Math.floor(kbMultiplier * (this.isStrongAttack ? 6 : 2)));
+                                
+                                createHitEffect(this.hitbox.x + hw/2, this.hitbox.y + 10, this.isStrongAttack);
                             }
-                            
-                            opp.damage += baseDmg;
-                            
-                            // 50%程度で撃墜できるよう、ダメージによる乗数カーブを調整
-                            let kbMultiplier = 1 + (opp.damage * 0.06); 
-                            
-                            opp.vx = (this.facingRight ? 1 : -1) * (baseKbX * kbMultiplier);
-                            opp.vy = -(baseKbY + (opp.damage * 0.04));
-                            
-                            // 相手を硬直させる
-                            opp.hitStun = (this.isStrongAttack ? 20 : 10) + Math.floor(opp.damage * 0.25);
-                            
-                            // ゲームフィールのためのヒットストップと画面揺れ
-                            hitStop = Math.min(12, Math.floor(kbMultiplier * (this.isStrongAttack ? 3 : 1)));
-                            screenShake = Math.min(30, Math.floor(kbMultiplier * (this.isStrongAttack ? 6 : 2)));
-                            
-                            createHitEffect(this.hitbox.x + hw/2, this.hitbox.y + 10, this.isStrongAttack);
                         }
                     });
                 }
@@ -470,6 +563,38 @@ class Player {
             }
         }
 
+        // --- 崖つかまり判定 ---
+        if (this.vy > 0 && !this.isGrounded && this.ledgeGrabCooldown === 0 && this.hitStun === 0) {
+            for (let plat of platforms) {
+                if (plat.type === 'solid') {
+                    // 左側の崖
+                    if (this.x + this.w > plat.x - 15 && this.x + this.w < plat.x + 5 &&
+                        this.y > plat.y - 20 && this.y < plat.y + 20) {
+                        this.isLedgeGrabbing = true;
+                        this.facingRight = true;
+                        this.x = plat.x - this.w + 8; // 少しめり込ませて掴んでいる感を出す
+                        this.y = plat.y - 8;
+                        this.vx = 0;
+                        this.vy = 0;
+                        this.jumps = 0; // 崖をつかんだらジャンプ回復
+                        break;
+                    }
+                    // 右側の崖
+                    if (this.x < plat.x + plat.w + 15 && this.x > plat.x + plat.w - 5 &&
+                        this.y > plat.y - 20 && this.y < plat.y + 20) {
+                        this.isLedgeGrabbing = true;
+                        this.facingRight = false;
+                        this.x = plat.x + plat.w - 8;
+                        this.y = plat.y - 8;
+                        this.vx = 0;
+                        this.vy = 0;
+                        this.jumps = 0;
+                        break;
+                    }
+                }
+            }
+        }
+
         // --- 画面外での撃墜（バースト）判定 ---
         if (this.y > BOUNDS.bottom || this.x < BOUNDS.left || this.x > BOUNDS.right || this.y < BOUNDS.top) {
             createBurstEffect(this.x, this.y, this.color);
@@ -482,6 +607,16 @@ class Player {
     }
 
     doJump() {
+        if (this.isLedgeGrabbing) {
+            this.isLedgeGrabbing = false;
+            this.ledgeGrabCooldown = 30;
+            this.vy = -this.jumpForce;
+            this.vx = this.facingRight ? 6 : -6; // 崖上がり時は前方にジャンプする
+            this.jumps = 1;
+            createHitEffect(this.x + this.w/2, this.y + this.h, false);
+            return;
+        }
+
         if (this.isGrounded) {
             this.vy = -this.jumpForce;
             this.jumps = 1;
@@ -498,12 +633,29 @@ class Player {
         this.isAttacking = true;
         this.isStrongAttack = isStrong;
         // 強攻撃はモーションが長い
-        this.attackFrame = isStrong ? 35 : 18; 
+        this.attackFrame = isStrong ? 30 : 15; 
         this.hasHit = false;
     }
 
     draw(ctx) {
         if (this.lives <= 0) return;
+
+        // リスポーン台座の描画
+        if (this.isRespawning) {
+            ctx.save();
+            // 光の柱
+            ctx.globalAlpha = 0.3;
+            ctx.fillStyle = this.color;
+            ctx.fillRect(this.x - 5, -200, this.w + 10, this.y + this.h + 200 + 10);
+            ctx.globalAlpha = 1.0;
+            
+            // 台座本体
+            ctx.fillStyle = '#ddd';
+            ctx.fillRect(this.x - 15, this.y + this.h, this.w + 30, 10);
+            ctx.fillStyle = '#777';
+            ctx.fillRect(this.x - 10, this.y + this.h + 10, this.w + 20, 5);
+            ctx.restore();
+        }
 
         // 無敵時の点滅
         if (this.invincible > 0 && Math.floor(Date.now() / 100) % 2 === 0) {
@@ -514,30 +666,97 @@ class Player {
         ctx.translate(this.x + this.w/2, this.y + this.h/2);
 
         // ふっとび中はキャラが回転する
-        if (this.hitStun > 0) {
+        if (this.hitStun > 0 && !this.isLedgeGrabbing) {
             ctx.rotate((this.hitStun * 0.4) * (this.vx > 0 ? 1 : -1));
         }
 
-        // キャラクター本体
+        // --- 人形の描画 ---
+        let dir = this.facingRight ? 1 : -1;
+        let time = Date.now() / 100;
+        // 地上を歩いている時の足のアニメーション用
+        let walkAnim = (this.isGrounded && Math.abs(this.vx) > 0.5 && this.hitStun === 0) ? Math.sin(time * 1.5) : 0;
+        // 空中にいる時の手足のアニメーション用
+        let jumpAnim = (!this.isGrounded && !this.isLedgeGrabbing) ? (this.vy < 0 ? -1 : 1) : 0;
+
+        ctx.lineCap = 'round';
+        ctx.lineJoin = 'round';
+        ctx.lineWidth = 6;
+        ctx.strokeStyle = this.color;
         ctx.fillStyle = this.color;
-        ctx.fillRect(-this.w/2, -this.h/2, this.w, this.h);
+
+        // 頭
+        ctx.beginPath();
+        ctx.arc(0, -10, 8, 0, Math.PI * 2);
+        ctx.fill();
+
+        // 胴体
+        ctx.beginPath();
+        ctx.moveTo(0, -2);
+        ctx.lineTo(0, 10);
+        ctx.stroke();
 
         // 目（向きを示す）
         ctx.fillStyle = '#fff';
-        let eyeOffsetX = this.facingRight ? 5 : -15;
-        ctx.fillRect(eyeOffsetX, -10, 10, 10);
-        
+        let eyeOffsetX = dir * 3;
+        ctx.fillRect(eyeOffsetX - 2, -13, 4, 4);
         ctx.fillStyle = '#000';
         let pupilOffsetX = this.facingRight ? 10 : -15;
         ctx.fillRect(pupilOffsetX, -5, 5, 5);
+
+        // ガード（シールド）の描画
+        if (this.isGuarding) {
+            ctx.beginPath();
+            ctx.arc(0, 0, 32, 0, Math.PI * 2);
+            ctx.fillStyle = 'rgba(255, 255, 255, 0.2)';
+            ctx.fill();
+            ctx.lineWidth = 3;
+            ctx.strokeStyle = 'rgba(100, 200, 255, 0.8)';
+            ctx.stroke();
+        }
+
+        // 腕と脚
+        ctx.beginPath();
+        if (this.isLedgeGrabbing) {
+            // 崖つかまりポーズ
+            ctx.moveTo(0, -2); ctx.lineTo(dir * 14, -18); // 腕（崖へ伸ばす）
+            ctx.moveTo(0, 10); ctx.lineTo(-4, 20);        // 脚（ぶら下がる）
+            ctx.moveTo(0, 10); ctx.lineTo(4, 20);
+        } else if (this.hitStun > 0) {
+            // ふっとびポーズ（手足バタバタ）
+            ctx.moveTo(0, -2); ctx.lineTo(-10, -10); // 腕
+            ctx.moveTo(0, -2); ctx.lineTo(10, -10);
+            ctx.moveTo(0, 10); ctx.lineTo(-12, 15);  // 脚
+            ctx.moveTo(0, 10); ctx.lineTo(12, 15);
+        } else {
+            // 脚 (歩き or ジャンプ)
+            if (jumpAnim !== 0) {
+                ctx.moveTo(0, 10); ctx.lineTo(-8, 16 + jumpAnim * 4);
+                ctx.moveTo(0, 10); ctx.lineTo(8, 16 - jumpAnim * 4);
+            } else {
+                ctx.moveTo(0, 10); ctx.lineTo(-8 + walkAnim * 12, 20);
+                ctx.moveTo(0, 10); ctx.lineTo(8 - walkAnim * 12, 20);
+            }
+
+            // 腕
+            if (this.isAttacking) {
+                // 攻撃中は腕を前に突き出す
+                ctx.moveTo(0, -2); ctx.lineTo(dir * 18, -2);
+                ctx.moveTo(0, -2); ctx.lineTo(-dir * 10, 4);
+            } else {
+                // 待機・歩行中は腕を振る
+                ctx.moveTo(0, -2); ctx.lineTo(-walkAnim * dir * 10, 8);
+                ctx.moveTo(0, -2); ctx.lineTo(walkAnim * dir * 10, 8);
+            }
+        }
+        ctx.stroke();
 
         // 攻撃中のエフェクト（パンチや剣の軌跡のようなもの）
         if (this.isAttacking) {
             let isHitboxActive = false;
             if (this.isStrongAttack) {
-                isHitboxActive = (this.attackFrame > 15 && this.attackFrame < 22);
+                isHitboxActive = (this.attackFrame >= 18 && this.attackFrame <= 25);
             } else {
-                isHitboxActive = (this.attackFrame > 8 && this.attackFrame < 13);
+                isHitboxActive = (this.attackFrame >= 10 && this.attackFrame <= 14);
             }
 
             if (isHitboxActive) {
@@ -546,9 +765,9 @@ class Player {
                 let effectH = this.isStrongAttack ? 15 : 10;
                 
                 if (this.facingRight) {
-                    ctx.fillRect(this.w/2, -effectH/2, effectW, effectH);
+                    ctx.fillRect(20, -effectH/2, effectW, effectH);
                 } else {
-                    ctx.fillRect(-this.w/2 - effectW, -effectH/2, effectW, effectH);
+                    ctx.fillRect(-20 - effectW, -effectH/2, effectW, effectH);
                 }
             }
         }
@@ -575,6 +794,25 @@ class CPUPlayer extends Player {
 
     update(opponents) {
         if (this.lives <= 0) return;
+        
+        // リスポーン中の処理 (ランダムなタイミングで降りる)
+        if (this.isRespawning) {
+            if (this.y >= this.targetRespawnY && Math.random() < 0.02) {
+                this.respawnTimer = 0; // 親のupdateで降りる処理が走る
+            }
+            super.update(opponents);
+            return;
+        }
+
+        // 崖つかまり中ならジャンプして復帰
+        if (this.isLedgeGrabbing) {
+            this.decisionTimer++;
+            if (this.decisionTimer % 20 === 0) {
+                this.doJump();
+            }
+            super.update(opponents); // 崖状態のまま親のupdateを呼んで待機
+            return;
+        }
         
         // ターゲット(1P)を取得
         let target = opponents[0];
@@ -648,20 +886,24 @@ function startGame(mode) {
     document.getElementById('start-screen').style.display = 'none';
     document.getElementById('game-over').style.display = 'none';
 
-    // プレイヤー1の生成
+    // プレイヤー1の生成 (ガードにShiftLeftを追加)
     p1 = new Player(1, 250, 150, '#ff5252', {
-        left: 'KeyA', right: 'KeyD', jump: 'KeyW', down: 'KeyS', attack: 'KeyF'
+        left: 'KeyA', right: 'KeyD', jump: 'KeyW', down: 'KeyS', attack: 'KeyF', guard: 'ShiftLeft'
     });
 
-    // プレイヤー2 または CPU の生成
+    // プレイヤー2 または CPU の生成 (ガードにShiftRightを追加)
     if (mode === 'cpu') {
         p2 = new CPUPlayer(2, 550, 150, '#888888'); // CPUはグレー
     } else {
         p2 = new Player(2, 550, 150, '#448aff', {
-            left: 'ArrowLeft', right: 'ArrowRight', jump: 'ArrowUp', down: 'ArrowDown', attack: 'Slash'
+            left: 'ArrowLeft', right: 'ArrowRight', jump: 'ArrowUp', down: 'ArrowDown', attack: 'Slash', guard: 'ShiftRight'
         });
     }
     p2.facingRight = false;
+
+    // ゲーム開始時にリスポーン演出を行う
+    p1.respawn();
+    p2.respawn();
 
     particles = [];
     isPlaying = true;
